@@ -27,7 +27,7 @@ and update the labels appropriately.
 1. Open a bugfix or feature pull request to `master`
 2. Your pull request is reviewed and you or a co-contributor merges it into `master`
 3. After it's been merged, you add backport label(s) to the pull request (ex. `target/2-0-x`)
-4. You create a new comment with the following body: `/trop run backport`
+4. You create a new comment with the following body: `/bot run backport`
 5. `trop` will begin the backport process for target branches you have specified via labels
 6. `trop` will automatically open pull requests containing `cherry-pick`s of the code into the backporting branches you specified in your labels (in this case, `2-0-x`).
 7. You or a co-contributor resolves any conflicts and merges in `trop`'s backports

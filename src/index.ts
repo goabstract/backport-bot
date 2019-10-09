@@ -255,7 +255,7 @@ PR is no longer targeting this branch for a backport',
     }
   });
 
-  const TROP_COMMAND_PREFIX = '/trop ';
+  const TROP_COMMAND_PREFIX = '/bot ';
 
   // manually trigger backporting process on trigger comment phrase
   robot.on('issue_comment.created', async (context: Context) => {
