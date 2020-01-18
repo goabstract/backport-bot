@@ -1,11 +1,16 @@
 import { Application, Context } from 'probot';
-import * as GitHub from '@octokit/rest';
+import {
+  PullsGetResponse,
+  ChecksListForRefResponseCheckRunsItem,
+  PullsGetResponseBase,
+  ChecksUpdateParams,
+  PullsListCommitsResponseItem,
+} from '@octokit/rest';
 import fetch from 'node-fetch';
 import * as fs from 'fs-extra';
 import { IQueue } from 'queue';
 import * as simpleGit from 'simple-git/promise';
 
-import { PullRequest } from './Probot';
 import queue from './Queue';
 import { CHECK_PREFIX } from './constants';
 import { PRStatus, BackportPurpose } from './enums';
@@ -15,11 +20,13 @@ import { initRepo } from './operations/init-repo';
 import { setupRemotes } from './operations/setup-remotes';
 import { backportCommitsToBranch } from './operations/backport-commits';
 import { getRepoToken } from './utils/token-util';
+import { getSupportedBranches } from './utils/branch-util';
+import { getEnvVar } from './utils/env-util';
 
 const makeQueue: IQueue = require('queue');
 const { parse: parseDiff } = require('what-the-diff');
 
-export const labelMergedPR = async (context: Context, pr: PullRequest, targetBranch: String) => {
+export const labelMergedPR = async (context: Context, pr: PullsGetResponse, targetBranch: String) => {
   const prMatch = pr.body.match(/#[0-9]{1,7}/);
   if (prMatch && prMatch[0]) {
     const prNumber = parseInt(prMatch[0].substring(1), 10);
@@ -32,7 +39,16 @@ export const labelMergedPR = async (context: Context, pr: PullRequest, targetBra
   }
 };
 
-const createBackportComment = (pr: PullRequest) => {
+const checkUserHasWriteAccess = async (context: Context, user: string) => {
+  const params = context.repo({ username: user });
+  const { data: userInfo } = await context.github.repos.getCollaboratorPermissionLevel(params);
+
+  // Possible values for the permission key: 'admin', 'write', 'read', 'none'.
+  // In order for the user's review to count, they must be at least 'write'.
+  return ['write', 'admin'].includes(userInfo.permission);
+};
+
+const createBackportComment = (pr: PullsGetResponse) => {
   let body = `Backport of #${pr.number}\n\nSee that PR for details.`;
 
   const onelineMatch = pr.body.match(/(?:(?:\r?\n)|^)notes: (.+?)(?:(?:\r?\n)|$)/gi);
@@ -57,7 +73,21 @@ export const backportImpl = async (robot: Application,
                                    purpose: BackportPurpose,
                                    labelToRemove?: string,
                                    labelToAdd?: string) => {
-  const base: GitHub.PullsGetResponseBase = context.payload.pull_request.base;
+
+  // Optionally disallow backports to EOL branches
+  const noEOLSupport = getEnvVar('NO_EOL_SUPPORT', '');
+  if (noEOLSupport) {
+    const supported = await getSupportedBranches(context);
+    if (!supported.includes(targetBranch)) {
+      await context.github.issues.createComment(context.repo({
+        body: `${targetBranch} is no longer supported - no backport will be initiated.`,
+        issue_number: context.payload.issue.number,
+      }));
+      return;
+    }
+  }
+
+  const base: PullsGetResponseBase = context.payload.pull_request.base;
   const slug = `${base.repo.owner.login}/${base.repo.name}`;
   const bp = `backport from PR #${context.payload.pull_request.number} to "${targetBranch}"`;
   robot.log(`Queuing ${bp} for "${slug}"`);
@@ -70,7 +100,7 @@ export const backportImpl = async (robot: Application,
       per_page: 100,
     }));
 
-    return allChecks.data.check_runs.find((run: GitHub.ChecksListForRefResponseCheckRunsItem) => {
+    return allChecks.data.check_runs.find((run: ChecksListForRefResponseCheckRunsItem) => {
       return run.name === `${CHECK_PREFIX}${targetBranch}`;
     });
   };
@@ -92,12 +122,11 @@ export const backportImpl = async (robot: Application,
         }
       }
 
-      log('getting repo access token');
       const repoAccessToken = await getRepoToken(robot, context);
 
-      const pr = context.payload.pull_request as any as PullRequest;
-      // Set up empty repo on master
-      log('Setting up local repository');
+      const pr: PullsGetResponse = context.payload.pull_request;
+
+      // Set up empty repo on master.
       const { dir } = await initRepo({
         slug,
         accessToken: repoAccessToken,
@@ -105,11 +134,7 @@ export const backportImpl = async (robot: Application,
       createdDir = dir;
       log(`Working directory cleaned: ${dir}`);
 
-      // Set up remotes
-      log('setting up remotes');
-      const targetRepoRemote =
-          `https://x-access-token:${repoAccessToken}@github.com/${slug}.git`;
-
+      const targetRepoRemote = `https://x-access-token:${repoAccessToken}@github.com/${slug}.git`;
       await setupRemotes({
         dir,
         remotes: [{
@@ -118,23 +143,23 @@ export const backportImpl = async (robot: Application,
         }],
       });
 
-      // Get list of commits
+      // Get list of commits.
       log(`Getting rev list from: ${pr.base.sha}..${pr.head.sha}`);
       const commits = (await context.github.pulls.listCommits(context.repo({
-        number: pr.number,
-      }))).data.map((commit: GitHub.PullsListCommitsResponseItem) => commit.sha!);
+        pull_number: pr.number,
+      }))).data.map((commit: PullsListCommitsResponseItem) => commit.sha!);
 
       // No commits == WTF
       if (commits.length === 0) {
-        log('Found no commits to backport, aborting');
+        log('Found no commits to backport - aborting backport process');
         return;
       }
 
-      // Over 240 commits is probably the limit from github so let's not bother
+      // Over 240 commits is probably the limit from GitHub so let's not bother.
       if (commits.length >= 240) {
         log(`Too many commits (${commits.length})...backport will not be performed.`);
         await context.github.issues.createComment(context.repo({
-          number: pr.number,
+          issue_number: pr.number,
           body: 'This PR has exceeded the automatic backport commit limit \
     and must be performed manually.',
         }));
@@ -142,7 +167,7 @@ export const backportImpl = async (robot: Application,
         return;
       }
 
-      log(`Found ${commits.length} commits to backport, requesting details now.`);
+      log(`Found ${commits.length} commits to backport - requesting details now.`);
       const patches: string[] = (new Array(commits.length)).fill('');
       const q = makeQueue({
         concurrency: 5,
@@ -166,7 +191,7 @@ export const backportImpl = async (robot: Application,
       await new Promise(r => q.start(r));
       log('Got all commit info');
 
-      // Temp branch
+      // Create temporary branch name.
       const sanitizedTitle = pr.title
         .replace(/\*/g, 'x').toLowerCase()
         .replace(/[^a-z0-9_]+/g, '-');
@@ -185,38 +210,45 @@ export const backportImpl = async (robot: Application,
         shouldPush: purpose === BackportPurpose.ExecuteBackport,
       });
 
-      log('Cherry pick success, pushed up to target_repo');
+      log('Cherry pick success - pushed up to target_repo');
 
       if (purpose === BackportPurpose.ExecuteBackport) {
         log('Creating Pull Request');
-        const newPr = (await context.github.pulls.create(context.repo({
+        const { data: newPr } = (await context.github.pulls.create(context.repo({
           head: `${tempBranch}`,
           base: targetBranch,
           title: pr.title,
           body: createBackportComment(pr),
           maintainer_can_modify: false,
-        }))).data;
+        })));
+
+        // If user has sufficient permissions (i.e has write access)
+        // request their review on the automatically backported pull request
+        if (await checkUserHasWriteAccess(context, pr.user.login)) {
+          await context.github.pulls.createReviewRequest(context.repo({
+            pull_number: newPr.number,
+            reviewers: [pr.user.login],
+          }));
+        }
 
         log('Adding breadcrumb comment');
         await context.github.issues.createComment(context.repo({
-          number: pr.number,
+          issue_number: pr.number,
           body: `I have automatically backported this PR to "${targetBranch}", \
     please check out #${newPr.number}`,
         }));
 
         if (labelToRemove) {
-          log(`Removing label '${labelToRemove}'`);
           await labelUtils.removeLabel(context, pr.number, labelToRemove);
         }
 
         if (labelToAdd) {
-          log(`Adding label '${labelToAdd}'`);
           await labelUtils.addLabel(context, pr.number, [labelToAdd]);
         }
 
         await labelUtils.addLabel(context, newPr.number!, ['backport', `${targetBranch}`]);
 
-        log('Backport complete');
+        log('Backport process complete');
       }
 
       if (purpose === BackportPurpose.Check) {
@@ -271,7 +303,7 @@ export const backportImpl = async (robot: Application,
       const pr = context.payload.pull_request;
       if (purpose === BackportPurpose.ExecuteBackport) {
         await context.github.issues.createComment(context.repo({
-          number: pr.number,
+          issue_number: pr.number,
           body: `I was unable to backport this PR to "${targetBranch}" cleanly;
    you will need to perform this backport manually.`,
         }) as any);
@@ -287,7 +319,7 @@ export const backportImpl = async (robot: Application,
         const checkRun = await getCheckRun();
         if (checkRun) {
           const mdSep = '``````````````````````````````';
-          const updateOpts: GitHub.ChecksUpdateParams = context.repo({
+          const updateOpts: ChecksUpdateParams = context.repo({
             check_run_id: checkRun.id,
             name: checkRun.name,
             conclusion: 'neutral' as 'neutral',
@@ -302,7 +334,7 @@ export const backportImpl = async (robot: Application,
           try {
             await context.github.checks.update(updateOpts as any);
           } catch (err) {
-            // A github error occurred, let's try mark it as a failure without annotations
+            // A GitHub error occurred - try to mark it as a failure without annotations.
             updateOpts.output!.annotations = undefined;
             await context.github.checks.update(updateOpts as any);
           }
