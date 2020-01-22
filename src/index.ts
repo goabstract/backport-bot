@@ -148,21 +148,19 @@ PR is no longer targeting this branch for a backport',
 
         // If a branch is targeting something that isn't master it might not be a backport;
         // allow for a label to skip backport validity check for these branches.
-        if (['labeled', 'unlabeled'].includes(context.payload.action)) {
-          if (await labelExistsOnPR(context, pr.number, SKIP_CHECK_LABEL)) {
-            await context.github.checks.update(context.repo({
-              check_run_id: checkRun.id,
-              name: checkRun.name,
-              conclusion: 'neutral' as 'neutral',
-              completed_at: (new Date()).toISOString(),
-              output: {
-                title: 'Backport Check Skipped',
-                summary: 'This PR is not a backport - skip backport validation check',
-              },
-            }));
+        if (await labelExistsOnPR(context, pr.number, SKIP_CHECK_LABEL)) {
+          await context.github.checks.update(context.repo({
+            check_run_id: checkRun.id,
+            name: checkRun.name,
+            conclusion: 'neutral' as 'neutral',
+            completed_at: (new Date()).toISOString(),
+            output: {
+              title: 'Backport Check Skipped',
+              summary: 'This PR is not a backport - skip backport validation check',
+            },
+          }));
 
-            return;
-          }
+          return;
         }
 
         const FASTTRACK_PREFIXES = ['build:', 'ci:'];
@@ -191,7 +189,7 @@ PR is no longer targeting this branch for a backport',
           // The current PR is only valid if the PR it is backporting
           // was merged to master or to a supported release branch.
           const supported = await getSupportedBranches(context);
-          if (['master', ...supported].includes(oldPR.base.ref)) {
+          if (!['master', ...supported].includes(oldPR.base.ref)) {
             failureCause = 'the PR that it is backporting was not targeting the master branch.';
           } else if (!oldPR.merged) {
             failureCause = 'the PR that is backporting has not been merged yet.';
