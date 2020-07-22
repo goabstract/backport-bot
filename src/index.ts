@@ -5,16 +5,25 @@ import { labelToTargetBranch, labelExistsOnPR } from './utils/label-utils';
 import { TropConfig } from './interfaces';
 import { CHECK_PREFIX, SKIP_CHECK_LABEL } from './constants';
 import { getEnvVar } from './utils/env-util';
-import { PRChange, PRStatus, BackportPurpose } from './enums';
-import { ChecksListForRefResponseCheckRunsItem, PullsGetResponse } from '@octokit/rest';
-import { backportToLabel, backportToBranch } from './operations/backport-to-location';
+import { PRChange, PRStatus, BackportPurpose, CheckRunStatus } from './enums';
+import {
+  ChecksListForRefResponseCheckRunsItem,
+  PullsGetResponse,
+} from '@octokit/rest';
+import {
+  backportToLabel,
+  backportToBranch,
+} from './operations/backport-to-location';
 import { updateManualBackport } from './operations/update-manual-backport';
-import { getSupportedBranches } from './utils/branch-util';
+import { getSupportedBranches, getBackportPattern } from './utils/branch-util';
+import { updateBackportValidityCheck } from './utils/checks-util';
 
 const probotHandler = async (robot: Application) => {
   const labelMergedPRs = async (context: Context, pr: PullsGetResponse) => {
     for (const label of pr.labels) {
-      const targetBranch = label.name.match(/(\d)+-(?:(?:[0-9]+-x$)|(?:x+-y$))/);
+      const targetBranch = label.name.match(
+        /^(\d)+-(?:(?:[0-9]+-x$)|(?:x+-y$))$/,
+      );
       if (targetBranch && targetBranch[0]) {
         await labelMergedPR(context, pr, label.name);
       }
@@ -29,58 +38,60 @@ const probotHandler = async (robot: Application) => {
   };
 
   const runCheck = async (context: Context, pr: PullsGetResponse) => {
-    const allChecks = await context.github.checks.listForRef(context.repo({
-      ref: pr.head.sha,
-      per_page: 100,
-    }));
-    const checkRuns = allChecks.data.check_runs.filter(run => run.name.startsWith(CHECK_PREFIX));
+    const allChecks = await context.github.checks.listForRef(
+      context.repo({
+        ref: pr.head.sha,
+        per_page: 100,
+      }),
+    );
+    const checkRuns = allChecks.data.check_runs.filter((run) =>
+      run.name.startsWith(CHECK_PREFIX),
+    );
 
     for (const label of pr.labels) {
       if (!label.name.startsWith(PRStatus.TARGET)) continue;
       const targetBranch = labelToTargetBranch(label, PRStatus.TARGET);
       const runName = `${CHECK_PREFIX}${targetBranch}`;
-      const existing = checkRuns.find(run => run.name === runName);
+      const existing = checkRuns.find((run) => run.name === runName);
       if (existing) {
         if (existing.conclusion !== 'neutral') continue;
 
-        await context.github.checks.update(context.repo({
-          name: existing.name,
-          check_run_id: existing.id,
-          status: 'queued' as 'queued',
-        }));
+        await context.github.checks.update(
+          context.repo({
+            name: existing.name,
+            check_run_id: existing.id,
+            status: 'queued' as 'queued',
+          }),
+        );
       } else {
-        await context.github.checks.create(context.repo({
-          name: runName,
-          head_sha: pr.head.sha,
-          status: 'queued' as 'queued',
-          details_url: 'https://github.com/electron/trop',
-        }));
+        await context.github.checks.create(
+          context.repo({
+            name: runName,
+            head_sha: pr.head.sha,
+            status: 'queued' as 'queued',
+            details_url: 'https://github.com/electron/trop',
+          }),
+        );
       }
 
-      await backportImpl(
-        robot,
-        context,
-        targetBranch,
-        BackportPurpose.Check,
-      );
+      await backportImpl(robot, context, targetBranch, BackportPurpose.Check);
     }
 
     for (const checkRun of checkRuns) {
-      if (!pr.labels.find(
-        label => label.name === `${PRStatus.TARGET}${checkRun.name.replace(CHECK_PREFIX, '')}`,
-      )) {
-        context.github.checks.update(context.repo({
-          check_run_id: checkRun.id,
-          name: checkRun.name,
-          conclusion: 'neutral' as 'neutral',
-          completed_at: (new Date()).toISOString(),
-          output: {
-            title: 'Cancelled',
-            summary: 'This trop check was cancelled and can be ignored as this \
-PR is no longer targeting this branch for a backport',
-            annotations: [],
-          },
-        }));
+      if (
+        !pr.labels.find(
+          (label) =>
+            label.name ===
+            `${PRStatus.TARGET}${checkRun.name.replace(CHECK_PREFIX, '')}`,
+        )
+      ) {
+        await updateBackportValidityCheck(context, checkRun, {
+          title: 'Cancelled',
+          summary:
+            'This trop check was cancelled and can be ignored as this \
+          PR is no longer targeting this branch for a backport',
+          conclusion: CheckRunStatus.NEUTRAL,
+        });
       }
     }
   };
@@ -92,21 +103,23 @@ PR is no longer targeting this branch for a backport',
     }
   };
 
-  const maybeGetManualBackportNumber = (context: Context) => {
+  const maybeGetManualBackportNumbers = (context: Context) => {
     const pr = context.payload.pull_request;
-    let backportNumber: null | number = null;
+    const backportNumbers: number[] = [];
 
     if (pr.user.login !== getEnvVar('BOT_USER_NAME')) {
+      const backportPattern = getBackportPattern();
       // Check if this PR is a manual backport of another PR.
-      const backportPattern = /(?:^|\n)(?:manual |manually )?backport.*(?:#(\d+)|\/pull\/(\d+))/im;
-      const match: Array<string> | null = pr.body.match(backportPattern);
-      if (match) {
+      let match: RegExpExecArray | null;
+      while ((match = backportPattern.exec(pr.body))) {
         // This might be the first or second capture group depending on if it's a link or not.
-        backportNumber = !!match[1] ? parseInt(match[1], 10) : parseInt(match[2], 10);
+        backportNumbers.push(
+          match[1] ? parseInt(match[1], 10) : parseInt(match[2], 10),
+        );
       }
     }
 
-    return backportNumber;
+    return backportNumbers;
   };
 
   const VALID_BACKPORT_CHECK_NAME = 'Valid Backport';
@@ -120,46 +133,63 @@ PR is no longer targeting this branch for a backport',
       'pull_request.unlabeled',
     ],
     async (context: Context) => {
-      const oldPRNumber = maybeGetManualBackportNumber(context);
+      const oldPRNumbers = maybeGetManualBackportNumbers(context);
+      robot.log(`Found ${oldPRNumbers.length} backport numbers for this PR`);
+
+      const pr = context.payload.pull_request;
 
       // Only check for manual backports when a new PR is opened or if the PR body is edited.
-      if (oldPRNumber && ['opened', 'edited'].includes(context.payload.action)) {
-        await updateManualBackport(context, PRChange.OPEN, oldPRNumber);
+      if (
+        oldPRNumbers.length > 0 &&
+        ['opened', 'edited'].includes(context.payload.action)
+      ) {
+        for (const oldPRNumber of oldPRNumbers) {
+          robot.log(
+            `Updating original backport at ${oldPRNumber} for ${pr.number}`,
+          );
+          await updateManualBackport(context, PRChange.OPEN, oldPRNumber);
+        }
       }
 
       // Check if the PR is going to master, if it's not check if it's correctly
       // tagged as a backport of a PR that has already been merged into master.
-      const pr = context.payload.pull_request;
-      const { data: allChecks } = await context.github.checks.listForRef(context.repo({
-        ref: pr.head.sha,
-        per_page: 100,
-      }));
-      let checkRun = allChecks.check_runs.find(run => run.name === VALID_BACKPORT_CHECK_NAME);
+      const { data: allChecks } = await context.github.checks.listForRef(
+        context.repo({
+          ref: pr.head.sha,
+          per_page: 100,
+        }),
+      );
+      let checkRun = allChecks.check_runs.find(
+        (run) => run.name === VALID_BACKPORT_CHECK_NAME,
+      );
 
       if (pr.base.ref !== 'master') {
         if (!checkRun) {
-          checkRun = (await context.github.checks.create(context.repo({
-            name: VALID_BACKPORT_CHECK_NAME,
-            head_sha: pr.head.sha,
-            status: 'queued' as 'queued',
-            details_url: 'https://github.com/electron/trop',
-          }))).data as any as ChecksListForRefResponseCheckRunsItem;
+          robot.log(`Queueing new check run for #${pr.number}`);
+          checkRun = ((
+            await context.github.checks.create(
+              context.repo({
+                name: VALID_BACKPORT_CHECK_NAME,
+                head_sha: pr.head.sha,
+                status: 'queued' as 'queued',
+                details_url: 'https://github.com/electron/trop',
+              }),
+            )
+          ).data as any) as ChecksListForRefResponseCheckRunsItem;
         }
 
         // If a branch is targeting something that isn't master it might not be a backport;
         // allow for a label to skip backport validity check for these branches.
         if (await labelExistsOnPR(context, pr.number, SKIP_CHECK_LABEL)) {
-          await context.github.checks.update(context.repo({
-            check_run_id: checkRun.id,
-            name: checkRun.name,
-            conclusion: 'neutral' as 'neutral',
-            completed_at: (new Date()).toISOString(),
-            output: {
-              title: 'Backport Check Skipped',
-              summary: 'This PR is not a backport - skip backport validation check',
-            },
-          }));
-
+          robot.log(
+            `#${pr.number} is labeled with ${SKIP_CHECK_LABEL} - skipping backport validation check`,
+          );
+          await updateBackportValidityCheck(context, checkRun, {
+            title: 'Backport Check Skipped',
+            summary:
+              'This PR is not a backport - skip backport validation check',
+            conclusion: CheckRunStatus.NEUTRAL,
+          });
           return;
         }
 
@@ -169,78 +199,118 @@ PR is no longer targeting this branch for a backport',
           getEnvVar('COMMITTER_USER_NAME'),
         ];
         const FASTTRACK_LABELS: string[] = ['fast-track 🚅'];
-        let failureCause = '';
 
-        if (!oldPRNumber) {
-          // Allow fast-track prefixes through this check.
+        const failureMap = new Map();
+
+        // There are several types of PRs which might not target master yet which are
+        // inherently valid; e.g roller-bot PRs. Check for and allow those here.
+        if (oldPRNumbers.length === 0) {
+          robot.log(
+            `#${pr.number} does not have backport numbers - checking fast track status`,
+          );
           if (
-            !FASTTRACK_PREFIXES.some(pre => pr.title.startsWith(pre)) &&
-            !FASTTRACK_USERS.some(user => pr.user.login === user) &&
-            !FASTTRACK_LABELS.some(label => pr.labels.some((prLabel: any) => prLabel.name === label))
+            !FASTTRACK_PREFIXES.some((pre) => pr.title.startsWith(pre)) &&
+            !FASTTRACK_USERS.some((user) => pr.user.login === user) &&
+            !FASTTRACK_LABELS.some((label) =>
+              pr.labels.some((prLabel: any) => prLabel.name === label),
+            )
           ) {
-            failureCause = 'is missing a "Backport of #{N}" declaration.  \
-  Check out the trop documentation linked below for more information.';
+            robot.log(
+              `#${pr.number} is not a fast track PR - marking check run as failed`,
+            );
+            await updateBackportValidityCheck(context, checkRun, {
+              title: 'Invalid Backport',
+              summary:
+                'This PR is targeting a branch that is not master but is missing a "Backport of #{N}" declaration.  \
+              Check out the trop documentation linked below for more information.',
+              conclusion: CheckRunStatus.FAILURE,
+            });
+          } else {
+            robot.log(
+              `#${pr.number} is a fast track PR - marking check run as succeeded`,
+            );
+            await updateBackportValidityCheck(context, checkRun, {
+              title: 'Valid Backport',
+              summary:
+                'This PR is targeting a branch that is not master but a designated fast-track backport which does  \
+              not require a manual backport number.',
+              conclusion: CheckRunStatus.SUCCESS,
+            });
           }
         } else {
-          const oldPR = (await context.github.pulls.get(context.repo({
-            pull_number: oldPRNumber,
-          }))).data;
-
-          // The current PR is only valid if the PR it is backporting
-          // was merged to master or to a supported release branch.
+          robot.log(
+            `#${pr.number} has backport numbers - checking their validity now`,
+          );
           const supported = await getSupportedBranches(context);
-          if (!['master', ...supported].includes(oldPR.base.ref)) {
-            failureCause = 'the PR that it is backporting was not targeting the master branch.';
-          } else if (!oldPR.merged) {
-            failureCause = 'the PR that is backporting has not been merged yet.';
+
+          for (const oldPRNumber of oldPRNumbers) {
+            robot.log(`Checking validity of #${oldPRNumber}`);
+            const oldPR = (
+              await context.github.pulls.get(
+                context.repo({
+                  pull_number: oldPRNumber,
+                }),
+              )
+            ).data;
+
+            // The current PR is only valid if the PR it is backporting
+            // was merged to master or to a supported release branch.
+            if (!['master', ...supported].includes(oldPR.base.ref)) {
+              const cause =
+                'the PR that it is backporting was not targeting the master branch.';
+              failureMap.set(oldPRNumber, cause);
+            } else if (!oldPR.merged) {
+              const cause =
+                'the PR that this is backporting has not been merged yet.';
+              failureMap.set(oldPRNumber, cause);
+            }
           }
         }
 
-        // No failureCause means that we must have succeeded.
-        if (failureCause === '') {
-          await context.github.checks.update(context.repo({
-            check_run_id: checkRun.id,
-            name: checkRun.name,
-            conclusion: 'success' as 'success',
-            completed_at: (new Date()).toISOString(),
-            details_url: 'https://github.com/electron/trop/blob/master/docs/manual-backports.md',
-            output: {
+        for (const oldPRNumber of oldPRNumbers) {
+          if (failureMap.has(oldPRNumber)) {
+            robot.log(
+              `#${
+                pr.number
+              } is targeting a branch that is not master - ${failureMap.get(
+                oldPRNumber,
+              )}`,
+            );
+            await updateBackportValidityCheck(context, checkRun, {
+              title: 'Invalid Backport',
+              summary: `This PR is targeting a branch that is not master but ${failureMap.get(
+                oldPRNumber,
+              )}`,
+              conclusion: CheckRunStatus.FAILURE,
+            });
+          } else {
+            robot.log(`#${pr.number} is a valid backpot of #${oldPRNumber}`);
+            await updateBackportValidityCheck(context, checkRun, {
               title: 'Valid Backport',
               summary: `This PR is declared as backporting "#${oldPRNumber}" which is a valid PR that has been merged into master`,
-            },
-          }));
-        } else {
-          await context.github.checks.update(context.repo({
-            check_run_id: checkRun.id,
-            name: checkRun.name,
-            conclusion: 'failure' as 'failure',
-            completed_at: (new Date()).toISOString(),
-            details_url: 'https://github.com/electron/trop/blob/master/docs/manual-backports.md',
-            output: {
-              title: 'Invalid Backport',
-              summary: `This PR is targeting a branch that is not master but ${failureCause}`,
-            },
-          }));
+              conclusion: CheckRunStatus.SUCCESS,
+            });
+          }
         }
       } else if (checkRun) {
-        // We are targeting master but for some reason have a check run???
-        // Let's mark this check as cancelled
-        await context.github.checks.update(context.repo({
-          check_run_id: checkRun.id,
-          name: checkRun.name,
-          conclusion: 'neutral' as 'neutral',
-          completed_at: (new Date()).toISOString(),
-          output: {
-            title: 'Cancelled',
-            summary: 'This PR is targeting `master` and is not a backport',
-            annotations: [],
-          },
-        }));
+        // If we're somehow targeting master and have a check run,
+        // we mark this check as cancelled.
+        robot.log(
+          `#${pr.number} is targeting 'master' and is not a backport - marking as cancelled`,
+        );
+        await updateBackportValidityCheck(context, checkRun, {
+          title: 'Cancelled',
+          summary: 'This PR is targeting `master` and is not a backport',
+          conclusion: CheckRunStatus.NEUTRAL,
+        });
       }
 
       // Only run the backportable checks on "opened" and "synchronize"
-      // an "edited" change can not impact backportability
-      if (context.payload.action === 'edited' || context.payload.action === 'synchronize') {
+      // an "edited" change can not impact backportability.
+      if (
+        context.payload.action === 'edited' ||
+        context.payload.action === 'synchronize'
+      ) {
         maybeRunCheck(context);
       }
     },
@@ -253,12 +323,15 @@ PR is no longer targeting this branch for a backport',
   // Backport pull requests to labeled targets when PR is merged.
   robot.on('pull_request.closed', async (context: Context) => {
     const pr: PullsGetResponse = context.payload.pull_request;
+    const oldPRNumbers = maybeGetManualBackportNumbers(context);
     if (pr.merged) {
-      robot.log(`Automatic backport merged for: #${pr.number}`);
-      const oldPRNumber = maybeGetManualBackportNumber(context);
-      if (oldPRNumber) {
+      if (oldPRNumbers.length > 0) {
+        robot.log(`Automatic backport merged for: #${pr.number}`);
+
         robot.log(`Labeling original PR for merged PR: #${pr.number}`);
-        await updateManualBackport(context, PRChange.CLOSE, oldPRNumber);
+        for (const oldPRNumber of oldPRNumbers) {
+          await updateManualBackport(context, PRChange.MERGE, oldPRNumber);
+        }
         await labelMergedPRs(context, pr);
       }
 
@@ -269,12 +342,29 @@ PR is no longer targeting this branch for a backport',
 
         robot.log(`Deleting base branch: ${pr.base.ref}`);
         try {
-          await context.github.git.deleteRef(context.repo({ ref: pr.base.ref }));
+          await context.github.git.deleteRef(
+            context.repo({ ref: pr.base.ref }),
+          );
         } catch (e) {
           robot.log('Failed to delete base branch: ', e);
         }
       } else {
+        robot.log(
+          `Backporting #${pr.number} to all branches specified by labels`,
+        );
         backportAllLabels(context, pr);
+      }
+    } else {
+      if (oldPRNumbers.length > 0) {
+        robot.log(
+          `Automatic backport #${pr.number} closed with unmerged commits`,
+        );
+
+        robot.log(`Updating label on original PR for closed PR: #${pr.number}`);
+        for (const oldPRNumber of oldPRNumbers) {
+          await updateManualBackport(context, PRChange.CLOSE, oldPRNumber);
+        }
+        await labelMergedPRs(context, pr);
       }
     }
   });
@@ -284,13 +374,15 @@ PR is no longer targeting this branch for a backport',
   // Manually trigger backporting process on trigger comment phrase.
   robot.on('issue_comment.created', async (context: Context) => {
     const payload = context.payload;
-    const config = await context.config<TropConfig>('config.yml') as TropConfig;
+    const config = (await context.config<TropConfig>(
+      'config.yml',
+    )) as TropConfig;
     if (!config || !Array.isArray(config.authorizedUsers)) {
       robot.log('missing or invalid config', config);
       return;
     }
 
-    const isPullRequest = (issue: { number: number, html_url: string }) =>
+    const isPullRequest = (issue: { number: number; html_url: string }) =>
       issue.html_url.endsWith(`/pull/${issue.number}`);
 
     if (!isPullRequest(payload.issue)) return;
@@ -299,92 +391,127 @@ PR is no longer targeting this branch for a backport',
     if (!cmd.startsWith(TROP_COMMAND_PREFIX)) return;
 
     if (!config.authorizedUsers.includes(payload.comment.user.login)) {
-      await context.github.issues.createComment(context.repo({
-        issue_number: payload.issue.number,
-        body: `@${payload.comment.user.login} is not authorized to run PR backports.`,
-      }));
+      robot.log(
+        `@${payload.comment.user.login} is not authorized to run PR backports - stopping`,
+      );
+      await context.github.issues.createComment(
+        context.repo({
+          issue_number: payload.issue.number,
+          body: `@${payload.comment.user.login} is not authorized to run PR backports.`,
+        }),
+      );
       return;
     }
 
     const actualCmd = cmd.substr(TROP_COMMAND_PREFIX.length);
 
-    const actions = [{
-      name: 'backport sanity checker',
-      command: /^run backport/,
-      execute: async () => {
-        const pr = (await context.github.pulls.get(
-          context.repo({ pull_number: payload.issue.number }))
-        ).data;
-        if (!pr.merged) {
-          await context.github.issues.createComment(context.repo({
-            issue_number: payload.issue.number,
-            body: 'This PR has not been merged yet, and cannot be backported.',
-          }));
-          return false;
-        }
-        return true;
-      },
-    }, {
-      name: 'backport automatically',
-      command: /^run backport$/,
-      execute: async () => {
-        const pr = (await context.github.pulls.get(
-          context.repo({ pull_number: payload.issue.number }))
-        ).data as any;
-        await context.github.issues.createComment(context.repo({
-          body: 'The backport process for this PR has been manually initiated, here we go! :D',
-          issue_number: payload.issue.number,
-        }));
-        backportAllLabels(context, pr);
-        return true;
-      },
-    }, {
-      name: 'backport to branch',
-      command: /^run backport-to ([^\s:]+)/,
-      execute: async (targetBranches: string) => {
-        const branches = targetBranches.split(',');
-        for (const branch of branches) {
-          robot.log(`backport-to ${branch}`);
-
-          if (!(branch.trim())) continue;
-          const pr = (await context.github.pulls.get(
-            context.repo({ pull_number: payload.issue.number }))
+    const actions = [
+      {
+        name: 'backport sanity checker',
+        command: /^run backport/,
+        execute: async () => {
+          const pr = (
+            await context.github.pulls.get(
+              context.repo({ pull_number: payload.issue.number }),
+            )
           ).data;
-
-          try {
-            (await context.github.repos.getBranch(context.repo({ branch })));
-          } catch (err) {
-            await context.github.issues.createComment(context.repo({
-              body: `The branch you provided "${branch}" does not appear to exist :cry:`,
-              issue_number: payload.issue.number,
-            }));
-            return true;
-          }
-
-          // Optionally disallow backports to EOL branches
-          const noEOLSupport = getEnvVar('NO_EOL_SUPPORT', '');
-          if (noEOLSupport) {
-            const supported = await getSupportedBranches(context);
-            if (!supported.includes(branch)) {
-              await context.github.issues.createComment(context.repo({
-                body: `${branch} is no longer supported - no backport will be initiated.`,
+          if (!pr.merged) {
+            await context.github.issues.createComment(
+              context.repo({
                 issue_number: payload.issue.number,
-              }));
-              return false;
-            }
+                body:
+                  'This PR has not been merged yet, and cannot be backported.',
+              }),
+            );
+            return false;
           }
-
-          await context.github.issues.createComment(context.repo({
-            body: `The backport process for this PR has been manually initiated -
-sending your commits to "${branch}"!`,
-            issue_number: payload.issue.number,
-          }));
-          context.payload.pull_request = context.payload.pull_request || pr;
-          backportToBranch(robot, context, branch);
-        }
-        return true;
+          return true;
+        },
       },
-    }];
+      {
+        name: 'backport automatically',
+        command: /^run backport$/,
+        execute: async () => {
+          const pr = (
+            await context.github.pulls.get(
+              context.repo({ pull_number: payload.issue.number }),
+            )
+          ).data as any;
+          await context.github.issues.createComment(
+            context.repo({
+              body:
+                'The backport process for this PR has been manually initiated, here we go! :D',
+              issue_number: payload.issue.number,
+            }),
+          );
+          backportAllLabels(context, pr);
+          return true;
+        },
+      },
+      {
+        name: 'backport to branch',
+        command: /^run backport-to ([^\s:]+)/,
+        execute: async (targetBranches: string) => {
+          const branches = targetBranches.split(',');
+          for (const branch of branches) {
+            robot.log(
+              `Initiatating backport to ${branch} from 'backport-to' comment`,
+            );
+
+            if (!branch.trim()) continue;
+            const pr = (
+              await context.github.pulls.get(
+                context.repo({ pull_number: payload.issue.number }),
+              )
+            ).data;
+
+            try {
+              await context.github.repos.getBranch(context.repo({ branch }));
+            } catch (err) {
+              await context.github.issues.createComment(
+                context.repo({
+                  body: `The branch you provided "${branch}" does not appear to exist :cry:`,
+                  issue_number: payload.issue.number,
+                }),
+              );
+              return true;
+            }
+
+            // Optionally disallow backports to EOL branches
+            const noEOLSupport = getEnvVar('NO_EOL_SUPPORT', '');
+            if (noEOLSupport) {
+              const supported = await getSupportedBranches(context);
+              if (!supported.includes(branch)) {
+                robot.log(
+                  `${branch} is no longer supported - no backport will be initiated`,
+                );
+                await context.github.issues.createComment(
+                  context.repo({
+                    body: `${branch} is no longer supported - no backport will be initiated.`,
+                    issue_number: payload.issue.number,
+                  }),
+                );
+                return false;
+              }
+            }
+
+            robot.log(
+              `Initiating manual backport process for #${payload.issue.number} to ${branch}`,
+            );
+            await context.github.issues.createComment(
+              context.repo({
+                body: `The backport process for this PR has been manually initiated -
+sending your commits to "${branch}"!`,
+                issue_number: payload.issue.number,
+              }),
+            );
+            context.payload.pull_request = context.payload.pull_request || pr;
+            backportToBranch(robot, context, branch);
+          }
+          return true;
+        },
+      },
+    ];
 
     for (const action of actions) {
       const match = actualCmd.match(action.command);
@@ -393,7 +520,7 @@ sending your commits to "${branch}"!`,
       robot.log(`running action: ${action.name} for comment`);
 
       // @ts-ignore (false positive on next line arg count)
-      if (!await action.execute(...match.slice(1))) {
+      if (!(await action.execute(...match.slice(1)))) {
         robot.log(`${action.name} failed, stopping responder chain`);
         break;
       }

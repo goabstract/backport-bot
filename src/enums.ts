@@ -1,5 +1,6 @@
 export enum PRChange {
   OPEN,
+  MERGE,
   CLOSE,
 }
 
@@ -21,4 +22,10 @@ export enum PRStatus {
   MERGED = 'merged/',
   IN_FLIGHT = 'in-flight/',
   NEEDS_MANUAL = 'needs-manual-bp/',
+}
+
+export enum CheckRunStatus {
+  NEUTRAL = 'neutral',
+  FAILURE = 'failure',
+  SUCCESS = 'success',
 }
